@@ -1,6 +1,7 @@
 #include "ROBLEX.h"
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include <Preferences.h>  // memoria flash del ESP32 (viene con el core, no hay que instalarla)
 
 // Seguidor de linea con el modulo sensor de linea (8 sensores QRE1113 + ADC ADS7830)
 // Lee los 8 sensores, calcula la posicion de la linea y, en marcha, ajusta la
@@ -18,6 +19,13 @@
 // hay que pasar todos los sensores sobre la linea y sobre el fondo (a mano o con el
 // joystick); cada sensor guarda el valor mas oscuro y el mas claro que vio. Al terminar,
 // los sensores que no vieron suficiente contraste conservan su calibracion anterior.
+// Con la calibracion automatica ("CAL,A" desde la app) el robot gira solo sobre su eje,
+// a un lado y al otro, para pasar los sensores sobre la linea; empezar con la linea
+// bajo el centro del robot.
+//
+// La calibracion, el PID, la velocidad, el umbral y el color de la linea se guardan en la
+// memoria flash del ESP32: se conservan al apagar el robot. Se guardan con el robot
+// detenido, para no frenar el PID mientras sigue la linea.
 //
 // Boton de la shield:
 //   toque corto          arrancar (2 segundos despues, para retirar la mano) o detener
@@ -27,17 +35,24 @@
 //   robot -> app: "SEN,s0,s1,...,s7,pos"  (pos de -3500 a 3500; sin pos si no hay linea
 //                                          o calibrando, que envia los valores sin calibrar)
 //                 "PID,kp,ki,kd,vel"      respuesta a "GET"
+//                 "VEL,n"                 velocidad base: respuesta a "VEL"
 //                 "UMB,n"                 umbral: respuesta a "GET"
 //                 "LIN,N" / "LIN,B"       color de la linea: respuesta a "GET" y a "LIN"
+//                 "RUN,1" / "RUN,0"       el robot arranco / se detuvo (y respuesta a "GET")
 //                 "CAL,1"                 entro en modo calibracion (y respuesta a "GET" si sigue)
 //                 "CAL,0,i,j..."          termino la calibracion; i, j = sensores sin contraste
+//                 "CLB,n0..n7,b0..b7"     calibracion guardada: valor sin calibrar del negro
+//                                         (n) y del blanco (b) de cada sensor; respuesta a
+//                                         "GET" y al terminar una calibracion
 //   app -> robot: "SEN,1" / "SEN,0"       activar / apagar el envio de sensores
 //                 "PID,kp,ki,kd,vel"      cambiar el PID y la velocidad base (0-255)
+//                 "VEL,n"                 cambiar solo la velocidad base (0-255), tambien en marcha
 //                 "UMB,n"                 cambiar el umbral (1-254)
 //                 "LIN,N" / "LIN,B"       seguir linea negra (fondo blanco) / blanca (fondo negro)
-//                 "GET"                   pedir PID, umbral, color de la linea y estado de calibracion
+//                 "GET"                   pedir PID, umbral, color, estado y calibracion guardada
 //                 "RUN,1" / "RUN,0"       arrancar / detener
 //                 "CAL,1" / "CAL,0"       entrar / terminar el modo calibracion ("CAL" alterna)
+//                 "CAL,A"                 calibracion automatica: el robot gira solo y termina solo
 //                 "outR,outL,R,G,B"       joystick: mueve el robot mientras no sigue la linea
 // Los mensajes de texto (por ejemplo al calibrar) se ven en la terminal de la app.
 
@@ -57,7 +72,18 @@
 #define PERIODO_ENVIO 50         // ms entre envios a la app, al debug serial y a la pantalla
 #define TIEMPO_BOTON_LARGO 1000  // ms manteniendo el boton para calibrar
 
+// si en marcha no ve la linea durante este tiempo, el robot se detiene (0 = nunca se detiene).
+// Debe ser mayor que lo que tarda en recuperar la linea en la curva mas cerrada de la pista.
+#define TIEMPO_SIN_LINEA 1500
+
+// calibracion automatica: velocidad de giro (0-255) y duracion de cada giro.
+// Gira a la derecha, a la izquierda el doble y vuelve al centro; si no alcanza a pasar todos
+// los sensores sobre la linea, sube la velocidad o el tiempo.
+#define VELOCIDAD_AUTOCAL 90
+#define TIEMPO_GIRO_AUTOCAL 500  // ms
+
 ROBLEX ROBLEX;
+Preferences memoria;  // ajustes guardados en la flash
 Adafruit_SSD1306 display(128, 64, &Wire, -1, 400000, 400000);  // configurar la pantalla oled (bus I2C a 400 kHz)
 
 String RobotName = "ROBLEX linea";  // nombre del robot en el bluetooth
@@ -74,6 +100,11 @@ bool calibrado = false;  // true si al menos un sensor ya se calibro
 bool calibrando = false;  // true mientras el robot esta en modo calibracion
 int calMinimo[8];         // lo visto en la calibracion en curso
 int calMaximo[8];
+
+bool autoCalibrando = false;       // true mientras el robot gira solo para calibrar
+unsigned long inicioAutoCal = 0;   // millis() al empezar la calibracion automatica
+
+bool guardarPendiente = false;  // hay ajustes nuevos que aun no estan en la flash
 
 // un sensor esta sobre la linea si su valor esta a menos de "umbral" del color de la linea
 // (con linea negra: valor menor que umbral; con linea blanca: mayor que 255 - umbral).
@@ -96,6 +127,7 @@ bool corriendo = false;  // true mientras el robot sigue la linea
 float integral = 0;      // suma de los errores (termino integral)
 int ultimoError = 0;     // error del ciclo anterior (termino derivativo)
 int ultimaPosicion = 0;  // ultima posicion vista, para saber por que lado se salio la linea
+unsigned long ultimaVezLinea = 0;  // millis() de la ultima vez que se vio la linea
 
 unsigned long ultimoControl = 0;
 unsigned long ultimoEnvio = 0;
@@ -151,6 +183,43 @@ void motores(int derecha, int izquierda) {
   Drive(LEFT_PWM, izquierda);
 }
 
+// lee de la flash los ajustes guardados; si no hay (primera vez), quedan los del programa
+void cargarAjustes() {
+  memoria.begin("linea", true);  // true = solo lectura
+  kp = memoria.getFloat("kp", kp);
+  ki = memoria.getFloat("ki", ki);
+  kd = memoria.getFloat("kd", kd);
+  velocidad = memoria.getInt("vel", velocidad);
+  umbral = memoria.getInt("umb", umbral);
+  lineaBlanca = memoria.getBool("blanca", lineaBlanca);
+  // la calibracion se guarda como bloque: solo se usa si tiene el tamano esperado
+  if (memoria.getBytesLength("min") == sizeof(minimo) && memoria.getBytesLength("max") == sizeof(maximo)) {
+    memoria.getBytes("min", minimo, sizeof(minimo));
+    memoria.getBytes("max", maximo, sizeof(maximo));
+    calibrado = true;
+  }
+  memoria.end();
+}
+
+// escribe los ajustes en la flash. Escribir la flash detiene el procesador unos
+// milisegundos, por eso loop() solo lo hace con el robot detenido
+void guardarAjustes() {
+  memoria.begin("linea", false);
+  memoria.putFloat("kp", kp);
+  memoria.putFloat("ki", ki);
+  memoria.putFloat("kd", kd);
+  memoria.putInt("vel", velocidad);
+  memoria.putInt("umb", umbral);
+  memoria.putBool("blanca", lineaBlanca);
+  if (calibrado) {
+    memoria.putBytes("min", minimo, sizeof(minimo));
+    memoria.putBytes("max", maximo, sizeof(maximo));
+  }
+  memoria.end();
+  guardarPendiente = false;
+  Serial.println("Ajustes guardados");
+}
+
 void setup() {
 
   Serial.begin(115200);  // iniciar debug serial
@@ -165,6 +234,9 @@ void setup() {
   ROBLEX.SetupMotor(3, RIGHT_PWM, 20000);
 
   motores(0, 0);  // empezar con los motores frenados
+
+  cargarAjustes();  // calibracion, PID, velocidad, umbral y color guardados
+  Serial.println(calibrado ? "Calibracion cargada de la memoria" : "Sin calibracion guardada");
 
   display.begin(SSD1306_SWITCHCAPVCC, 0x3C);  // iniciar la pantalla oled
   display.setTextColor(WHITE);
@@ -232,10 +304,36 @@ bool tieneContraste(int i) {
   return calMaximo[i] - calMinimo[i] >= CONTRASTE_MINIMO;
 }
 
+// hay ajustes nuevos: loop() los guarda en la flash cuando el robot este detenido
+unsigned long ultimoCambio = 0;
+void marcarCambio() {
+  guardarPendiente = true;
+  ultimoCambio = millis();
+}
+
+// envia a la app la calibracion guardada: "CLB,n0..n7,b0..b7" con el valor sin calibrar
+// que cada sensor toma como negro (n) y como blanco (b)
+void enviarCalibracion() {
+  String linea = "CLB";
+  for (int i = 0; i < 8; i++) {
+    linea += "," + String(minimo[i]);
+  }
+  for (int i = 0; i < 8; i++) {
+    linea += "," + String(maximo[i]);
+  }
+  ROBLEX.BluetoothWrite(linea);
+}
+
 // entra en modo calibracion: dura hasta terminarCalibracion()
-void empezarCalibracion() {
+// automatica = true: el robot gira solo (ver autoCalibrar) y termina solo
+void empezarCalibracion(bool automatica) {
   if (calibrando) {
-    ROBLEX.BluetoothWrite("CAL,1");  // ya estaba calibrando: solo confirmar a la app
+    // ya estaba calibrando: se puede pasar de manual a automatica sin perder lo visto
+    if (automatica && !autoCalibrando) {
+      autoCalibrando = true;
+      inicioAutoCal = millis();
+    }
+    ROBLEX.BluetoothWrite("CAL,1");  // confirmar a la app
     return;
   }
   if (corriendo) {
@@ -246,10 +344,31 @@ void empezarCalibracion() {
     calMaximo[i] = 0;
   }
   calibrando = true;
+  autoCalibrando = automatica;
+  inicioAutoCal = millis();
 
   ROBLEX.Rgb(255, 0, 255);  // led morado: calibrando
   ROBLEX.BluetoothWrite("CAL,1");
-  mensaje("Calibrando: pasa todos los sensores sobre la linea y sobre el fondo, y vuelve a tocar calibrar para terminar");
+  if (automatica) {
+    mensaje("Calibracion automatica: el robot gira solo sobre la linea");
+  } else {
+    mensaje("Calibrando: pasa todos los sensores sobre la linea y sobre el fondo, y vuelve a tocar calibrar para terminar");
+  }
+}
+
+// calibracion automatica: gira a la derecha, a la izquierda el doble y vuelve al centro,
+// para que todos los sensores pasen sobre la linea y sobre el fondo. Se llama en cada ciclo.
+void autoCalibrar() {
+  unsigned long t = millis() - inicioAutoCal;
+  if (t < TIEMPO_GIRO_AUTOCAL) {
+    motores(-VELOCIDAD_AUTOCAL, VELOCIDAD_AUTOCAL);  // girar a la derecha
+  } else if (t < 3 * TIEMPO_GIRO_AUTOCAL) {
+    motores(VELOCIDAD_AUTOCAL, -VELOCIDAD_AUTOCAL);  // girar a la izquierda
+  } else if (t < 4 * TIEMPO_GIRO_AUTOCAL) {
+    motores(-VELOCIDAD_AUTOCAL, VELOCIDAD_AUTOCAL);  // volver al centro
+  } else {
+    terminarCalibracion();
+  }
 }
 
 // termina el modo calibracion: cada sensor que vio suficiente contraste toma su nuevo
@@ -258,6 +377,10 @@ void terminarCalibracion() {
   if (!calibrando) {
     ROBLEX.BluetoothWrite("CAL,0");  // no estaba calibrando: solo confirmar a la app
     return;
+  }
+  if (autoCalibrando) {
+    autoCalibrando = false;
+    motores(0, 0);
   }
   calibrando = false;
 
@@ -275,6 +398,10 @@ void terminarCalibracion() {
   }
 
   ROBLEX.BluetoothWrite(respuesta);
+  enviarCalibracion();  // para que la app muestre los nuevos rangos
+  if (calibrado) {
+    marcarCambio();
+  }
   if (sinContraste == "") {
     mensaje("Calibracion lista");
   } else {
@@ -316,7 +443,9 @@ void arrancar() {
   }
   integral = 0;
   ultimoError = ultimaPosicion;  // evita un golpe del termino derivativo al arrancar
+  ultimaVezLinea = millis();     // el tiempo sin linea cuenta desde el arranque
   corriendo = true;
+  ROBLEX.BluetoothWrite("RUN,1");  // estado para la app
   mensaje("En marcha");
   pantallaEnMarcha();
 }
@@ -324,6 +453,7 @@ void arrancar() {
 void detener() {
   corriendo = false;
   motores(0, 0);
+  ROBLEX.BluetoothWrite("RUN,0");  // estado para la app
   mensaje("Detenido");
 }
 
@@ -380,20 +510,45 @@ void cambiarPID(String cmd) {
   kd = ROBLEX.AppValue[3].toFloat();
   velocidad = constrain(ROBLEX.AppValue[4].toInt(), 0, 255);
   integral = 0;
+  marcarCambio();
 
   Serial.println("PID kp " + String(kp, 4) + " ki " + String(ki, 4) + " kd " + String(kd, 4) + " vel " + String(velocidad));
 }
 
+// lee el numero de un comando "XXX,n"; devuelve false si no es un entero positivo
+bool leerEntero(String cmd, int &valor) {
+  String texto = cmd.substring(4);
+  texto.trim();
+  if (cmd.length() < 5 || cmd[3] != ',' || texto.length() == 0 || !isDigit(texto[0]) || texto.indexOf(',') >= 0) {
+    return false;
+  }
+  valor = texto.toInt();
+  return true;
+}
+
 // "UMB,n": cambia el umbral (1-254, tambien en marcha)
 void cambiarUmbral(String cmd) {
-  String valor = cmd.substring(4);
-  valor.trim();
-  if (valor.length() == 0 || !isDigit(valor[0]) || valor.indexOf(',') >= 0) {
+  int valor;
+  if (!leerEntero(cmd, valor)) {
     mensaje("Uso: UMB,n (n de 1 a 254)");
     return;
   }
-  umbral = constrain(valor.toInt(), 1, 254);
+  umbral = constrain(valor, 1, 254);
+  marcarCambio();
   Serial.println("Umbral " + String(umbral));
+}
+
+// "VEL,n": cambia solo la velocidad base (0-255), tambien en marcha; responde "VEL,n"
+void cambiarVelocidad(String cmd) {
+  int valor;
+  if (!leerEntero(cmd, valor)) {
+    mensaje("Uso: VEL,n (n de 0 a 255)");
+    return;
+  }
+  velocidad = constrain(valor, 0, 255);
+  marcarCambio();
+  ROBLEX.BluetoothWrite("VEL," + String(velocidad));  // confirmar a la app
+  Serial.println("Velocidad " + String(velocidad));
 }
 
 // informa a la app el color de la linea: "LIN,N" negra o "LIN,B" blanca
@@ -405,6 +560,9 @@ void enviarColorLinea() {
 void cambiarColorLinea(bool blanca) {
   if (blanca != lineaBlanca && corriendo) {
     detener();  // con el otro color el robot veria el fondo como linea
+  }
+  if (blanca != lineaBlanca) {
+    marcarCambio();
   }
   lineaBlanca = blanca;
   Serial.println(lineaBlanca ? "Linea blanca sobre fondo negro" : "Linea negra sobre fondo blanco");
@@ -422,7 +580,7 @@ void comandoApp(String cmd) {
   // mueve el robot solo si no esta siguiendo la linea (sirve tambien para calibrar);
   // el led sigue mostrando el estado del seguidor
   if (isDigit(cmd[0]) || cmd[0] == '-') {
-    if (!corriendo) {
+    if (!corriendo && !autoCalibrando) {
       ROBLEX.ReadApp(cmd);  //leer la aplicacion y asigna las siguientes variables
       /*
         ROBLEX.AppValue[0]  = valor del motor derecho
@@ -438,24 +596,30 @@ void comandoApp(String cmd) {
   } else if (cmd == "SEN,0") {
     enviarSensores = false;
   } else if (cmd == "CAL,1") {
-    empezarCalibracion();
+    empezarCalibracion(false);
+  } else if (cmd == "CAL,A") {
+    empezarCalibracion(true);
   } else if (cmd == "CAL,0") {
     terminarCalibracion();
   } else if (cmd == "CAL") {  // alterna, para escribirlo a mano en la terminal
     if (calibrando) {
       terminarCalibracion();
     } else {
-      empezarCalibracion();
+      empezarCalibracion(false);
     }
   } else if (cmd == "GET") {
     enviarPID();
     ROBLEX.BluetoothWrite("UMB," + String(umbral));
     enviarColorLinea();
+    ROBLEX.BluetoothWrite(corriendo ? "RUN,1" : "RUN,0");
+    enviarCalibracion();
     if (calibrando) {
       ROBLEX.BluetoothWrite("CAL,1");  // la app se reconecto en medio de una calibracion
     }
   } else if (cmd.startsWith("PID,")) {
     cambiarPID(cmd);
+  } else if (cmd.startsWith("VEL")) {
+    cambiarVelocidad(cmd);
   } else if (cmd.startsWith("UMB")) {
     cambiarUmbral(cmd);
   } else if (cmd == "LIN,N") {
@@ -469,6 +633,9 @@ void comandoApp(String cmd) {
       arrancar();
     }
   } else if (cmd == "RUN,0") {
+    if (autoCalibrando) {
+      terminarCalibracion();  // "Detener" tambien frena la calibracion automatica
+    }
     detener();
   } else {
     mensaje("Comando desconocido: " + cmd);
@@ -522,7 +689,7 @@ void leerBoton() {
   delay(50);  // antirrebote
 
   if (largo) {
-    empezarCalibracion();  // empieza al soltar, con el robot ya en posicion
+    empezarCalibracion(false);  // empieza al soltar, con el robot ya en posicion
   } else {
     ROBLEX.Rgb(255, 255, 0);  // led amarillo: a punto de arrancar
     mensaje("Arranca en 2 segundos");
@@ -631,8 +798,14 @@ void dibujar(bool hayLinea, int posicion) {
 
 void loop() {
 
-  leerApp();    // comandos de la app (SEN, PID, UMB, LIN, GET, RUN, CAL y joystick)
+  leerApp();    // comandos de la app (SEN, PID, VEL, UMB, LIN, GET, RUN, CAL y joystick)
   leerBoton();  // arrancar, detener o calibrar con el boton de la shield
+
+  // guardar en la flash con el robot quieto, un segundo despues del ultimo cambio
+  // (asi varios comandos seguidos se guardan de una sola vez)
+  if (guardarPendiente && !corriendo && !calibrando && millis() - ultimoCambio > 1000) {
+    guardarAjustes();
+  }
 
   // leer los sensores y corregir siempre al mismo ritmo, para que kp, ki y kd
   // se comporten igual sin importar lo que tarde el resto del loop
@@ -645,6 +818,9 @@ void loop() {
     if (corriendo) {
       detener();  // sin sensores no se puede seguir la linea
     }
+    if (autoCalibrando) {
+      terminarCalibracion();  // frena el giro; aplica solo lo que alcanzo a ver
+    }
     Serial.println("Error leyendo el sensor de linea");
     ROBLEX.Rgb(255, 0, 0);
     delay(500);
@@ -655,11 +831,19 @@ void loop() {
   bool hayLinea = posicionLinea(posicion);
   if (hayLinea) {
     ultimaPosicion = posicion;
+    ultimaVezLinea = millis();
+  }
+
+  if (autoCalibrando) {
+    autoCalibrar();  // girar segun el tiempo transcurrido; termina sola
   }
 
   if (corriendo) {
     if (hayLinea) {
       seguirLinea(posicion);
+    } else if (TIEMPO_SIN_LINEA > 0 && millis() - ultimaVezLinea > TIEMPO_SIN_LINEA) {
+      mensaje("Linea perdida: robot detenido");  // seguridad: no seguir girando sin rumbo
+      detener();
     } else {
       // si no se ve la linea se asume que salio por el ultimo lado en el que estuvo: girar hacia ese lado
       seguirLinea(ultimaPosicion < 0 ? -3500 : 3500);
@@ -672,7 +856,7 @@ void loop() {
   }
   ultimoEnvio = millis();
 
-  if (!corriendo && !ROBLEX.BluetoothConnected()) {
+  if (!corriendo && !autoCalibrando && !ROBLEX.BluetoothConnected()) {
     motores(0, 0);  // seguridad: si se pierde la conexion, frenar lo que movia el joystick
   }
 
